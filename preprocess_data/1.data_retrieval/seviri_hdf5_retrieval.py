@@ -1,3 +1,4 @@
+import argparse
 import fnmatch
 import os
 import shutil
@@ -63,6 +64,33 @@ def import_SEVIRI(file_path: str):
     )
     return scn
 
+def generate_area_def(
+    scene: Scene, min_lon: float, max_lon: float, min_lat: float, max_lat: float
+):
+    proj_dict = {"proj": "longlat", "datum": "WGS84"}
+
+    # Calculate the resolution from the original scene's area extent and shape
+    orig_area = scene.finest_area()  # Get the finest area from the scene
+    orig_shape = (
+        orig_area.width,
+        orig_area.height,
+    )  # Original width and height in pixels
+
+    # Calculate the resolution in degrees/pixel
+    lons, lats = scene["IR_108"].attrs["area"].get_lonlats()
+    lons[lons==np.inf] = np.nan
+    lats[lats==np.inf] = np.nan
+    lon_res = (np.nanmin(lons) - np.nanmax(lons)) / orig_shape[0]
+    lat_res = (np.nanmin(lats) - np.nanmax(lats)) / orig_shape[1]
+
+    return create_area_def(
+        "my_area",
+        proj_dict,
+        area_extent=(min_lon, min_lat, max_lon, max_lat),
+        units="degrees",
+        resolution=(lon_res, lat_res),
+    )
+
 
 def regrid_reproject(
     scene: Scene, min_lon: float, max_lon: float, min_lat: float, max_lat: float
@@ -78,8 +106,10 @@ def regrid_reproject(
 
     # Calculate the resolution in degrees/pixel
     lons, lats = scene["IR_108"].attrs["area"].get_lonlats()
-    lon_res = (np.min(lons) - np.max(lons)) / orig_shape[0]
-    lat_res = (np.min(lats) - np.max(lats)) / orig_shape[1]
+    lons[lons==np.inf] = np.nan
+    lats[lats==np.inf] = np.nan
+    lon_res = (np.nanmin(lons) - np.nanmax(lons)) / orig_shape[0]
+    lat_res = (np.nanmin(lats) - np.nanmax(lats)) / orig_shape[1]
 
     new_area = create_area_def(
         "my_area",
@@ -130,9 +160,21 @@ def download_api_products(
             customisation = datatailor.new_customisation(product, chain)
             stream = None
             while True:
-                status = customisation.status
+                try:
+                    status = customisation.status
+                except eumdac.customisation.UnableToGetCustomisationError:
+                    print("Unable to get customization. Retrying")
+                    time.sleep(30)
+                    status = customisation.status
+                
                 if "DONE" in status:
-                    zip_files = fnmatch.filter(customisation.outputs, "*")[0]
+                    try:
+                        output = customisation.outputs
+                    except eumdac.customisation.UnableToGetCustomisationError:
+                        time.sleep(10)
+                        output = customisation.outputs
+                    zip_files = fnmatch.filter(output, "*")[0]
+
                     with customisation.stream_output(zip_files) as stream:
                         fname = OUTPUTDIR / stream.name
                         # Check if stream.name (the file path) already exists
@@ -177,7 +219,10 @@ def download_api_products(
                 scn = import_SEVIRI(str(file_path))
                 print("file imported")
 
-                customisation.delete()
+                try:
+                    customisation.delete()
+                except eumdac.customisation.CustomisationError:
+                    print("failed to delete customization.")
 
                 # reproject the file in right format
                 rpj_scn = regrid_reproject(scn, min_lon, max_lon, min_lat, max_lat)
@@ -229,17 +274,34 @@ def download_api_products(
             #             )
 
 
-def parallel_download_api_products(list_of_products, list_of_dirs, threads=3):
+def parallel_download_api_products(
+    list_of_products,
+    list_of_dirs: list[str],
+    datatailor: eumdac.datatailor.DataTailor,
+    chain: eumdac.tailor_models.Chain,
+    threads=4,
+):
     # Set number of threads (cores) used for parallel run and map threads
     if threads is None:
         pool = Pool()
     else:
         pool = Pool(nodes=threads)
-    results = pool.map(download_api_products, list_of_products, list_of_dirs)
+    datatailors = [datatailor] * len(list_of_dirs)
+    chains = [chain] * len(list_of_dirs)
+    results = pool.map(download_api_products, list_of_products, list_of_dirs, datatailors, chains)
     return results
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="seviri-cli",
+        description="Download seviri data from EUMDAC",
+    )
+    parser.add_argument("year")
+    parser.add_argument("month")
+    args = parser.parse_args()
+    year = int(args.year)
+    month = int(args.month)
     # Insert your personal key and secret into the single quotes
     credentials = get_credentials()
 
@@ -254,8 +316,11 @@ if __name__ == "__main__":
     collection = "EO:EUM:DAT:MSG:HRSEVIRI"
 
     # Set sensing start and end time
-    start = datetime(2024, 1, 1, 0, 0)
-    end = datetime(2024, 2, 1, 0, 0)
+    start = datetime(year, month, 1, 0, 0)
+    if month < 12:
+        end = datetime(year, month+1, 1, 0, 0)
+    else:
+        end = datetime(year+1, 1, 1, 0, 0)
 
     # Bounding box (in degrees)
     min_lon = 3
@@ -293,7 +358,7 @@ if __name__ == "__main__":
 
     # Parallel processing with timing
     start = time.time()
-    # parallel_download_api_products(nested_products, list_of_dirs)
+    # parallel_download_api_products(nested_products, list_of_dirs, datatailor, chain)
     download_api_products(products, str(OUTPUTDIR), datatailor, chain)
     stop = time.time()
     print(f"Execution time (minutes): {(stop - start) / 60}")
