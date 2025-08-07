@@ -1,0 +1,10 @@
+eumdac
+cartopy
+satpy
+netcdf4
+pyresample
+rasterio
+pyproj
+pathos
+gpm-api
+h5py
